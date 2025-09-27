@@ -1,9 +1,10 @@
-# etl_03_dimensiones.py
+# etl_03_dimensiones.py  — versión corregida con normalización de fechas (es->en)
 import os, re
 import pandas as pd
 from unidecode import unidecode
 import psycopg2
 from psycopg2.extras import execute_values
+from datetime import datetime
 
 DB = dict(
     host=os.getenv("PGHOST","localhost"),
@@ -15,6 +16,56 @@ DB = dict(
 
 SCHEMA_STG="stg"; SCHEMA_DW="dw"
 
+# ---------------------------
+# Utilidades de parsing fecha
+# ---------------------------
+SPANISH_MONTHS = {
+    "ene":"jan","feb":"feb","mar":"mar","abr":"apr","may":"may","jun":"jun",
+    "jul":"jul","ago":"aug","sep":"sep","set":"sep","oct":"oct","nov":"nov","dic":"dec",
+    "enero":"january","febrero":"february","marzo":"march","abril":"april","mayo":"may","junio":"june",
+    "julio":"july","agosto":"august","septiembre":"september","setiembre":"september",
+    "octubre":"october","noviembre":"november","diciembre":"december"
+}
+
+def normalize_spanish_months(s: str) -> str:
+    if not s: 
+        return s
+    s0 = unidecode(str(s))
+    # Reemplaza palabras/abreviaturas de meses en español por inglés (case-insensitive)
+    def repl(m):
+        w = m.group(0)
+        key = w.lower()
+        return SPANISH_MONTHS.get(key, w)
+    keys = sorted(SPANISH_MONTHS.keys(), key=len, reverse=True)
+    pat = r"\b(" + "|".join(re.escape(k) for k in keys) + r")\b"
+    return re.sub(pat, repl, s0, flags=re.IGNORECASE)
+
+def normalize_date_any(value) -> pd.Timestamp | None:
+    """
+    Acepta fechas como '21-Ago-2025 04:51PM', '2025/08/21', '21-08-2025', etc.
+    Devuelve pd.Timestamp o None.
+    """
+    if pd.isna(value):
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+
+    s_norm = normalize_spanish_months(s)
+
+    ts = pd.to_datetime(s_norm, errors="coerce", dayfirst=True, infer_datetime_format=True)
+    if pd.isna(ts):
+        for fmt in ("%d-%b-%Y %I:%M%p", "%d-%b-%Y", "%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y %H:%M", "%d-%m-%Y"):
+            try:
+                ts = pd.to_datetime(datetime.strptime(s_norm, fmt))
+                break
+            except Exception:
+                continue
+    return None if pd.isna(ts) else ts
+
+# ---------------------------
+# Utilidades generales
+# ---------------------------
 def pick(df: pd.DataFrame, pats):
     for p in pats:
         rx = re.compile(p)
@@ -22,6 +73,9 @@ def pick(df: pd.DataFrame, pats):
             if rx.search(c): return c
     return None
 
+# ---------------------------
+# DIM: Aseguradora
+# ---------------------------
 def upsert_aseguradora():
     inserted=0
     with psycopg2.connect(**DB) as conn:
@@ -46,12 +100,21 @@ def upsert_aseguradora():
         inserted=len(rows)
     print(f"[DIM_ASEGURADORA] upsert {inserted}")
 
+# ---------------------------
+# DIM: Paciente (SCD2)
+# ---------------------------
 def scd2_upsert_paciente(df_src: pd.DataFrame):
     ins=0
     with psycopg2.connect(**DB) as conn, conn.cursor() as cur:
         for _,r in df_src.iterrows():
             nk = str(r.get("paciente_nk","")).strip()
-            if not nk: continue
+            if not nk: 
+                continue
+
+            # Normaliza fecha de ingreso por seguridad
+            ts_ing = normalize_date_any(r.get("fecha_ingreso"))
+            f_ing = ts_ing.date() if ts_ing is not None else None
+
             cur.execute("""SELECT paciente_id,nombre,municipio,estado,aseguradora,zona,fecha_ingreso
                            FROM dw.dim_paciente WHERE paciente_nk=%s AND es_actual=TRUE""",(nk,))
             row = cur.fetchone()
@@ -61,7 +124,7 @@ def scd2_upsert_paciente(df_src: pd.DataFrame):
                 for col in ["nombre","municipio","estado","aseguradora","zona"]:
                     if str(r.get(col) or "").strip()!=str(locals()[col] or "").strip():
                         changed=True; break
-                if not changed and str(r.get("fecha_ingreso") or "")!=str(fecha_ingreso or ""):
+                if not changed and str(f_ing or "") != str(fecha_ingreso or ""):
                     changed=True
                 if changed:
                     cur.execute("""UPDATE dw.dim_paciente SET vigente_hasta=now(), es_actual=FALSE
@@ -69,18 +132,27 @@ def scd2_upsert_paciente(df_src: pd.DataFrame):
             if (not row) or changed:
                 cur.execute("""INSERT INTO dw.dim_paciente(paciente_nk,nombre,municipio,estado,aseguradora,zona,fecha_ingreso)
                                VALUES (%s,%s,%s,%s,%s,%s,%s)""",
-                            (nk,r.get("nombre"),r.get("municipio"),r.get("estado"),
-                             r.get("aseguradora"),r.get("zona"),r.get("fecha_ingreso")))
+                            (nk,
+                             r.get("nombre"),
+                             r.get("municipio"),
+                             r.get("estado"),
+                             r.get("aseguradora"),
+                             r.get("zona"),
+                             f_ing))
                 ins+=1
         conn.commit()
     print(f"[DIM_PACIENTE] upsert/SCD2 insertados {ins}")
 
+# ---------------------------
+# DIM: Equipo (SCD2)
+# ---------------------------
 def scd2_upsert_equipo(df_src: pd.DataFrame):
     ins=0
     with psycopg2.connect(**DB) as conn, conn.cursor() as cur:
         for _,r in df_src.iterrows():
             nk=str(r.get("equipo_nk","")).strip()
-            if not nk: continue
+            if not nk: 
+                continue
             cur.execute("""SELECT equipo_id,equipo,estado_equipo FROM dw.dim_equipo
                            WHERE equipo_nk=%s AND es_actual=TRUE""",(nk,))
             row=cur.fetchone()
@@ -100,6 +172,9 @@ def scd2_upsert_equipo(df_src: pd.DataFrame):
         conn.commit()
     print(f"[DIM_EQUIPO] upsert/SCD2 insertados {ins}")
 
+# ---------------------------
+# DIM: Medicamento/Insumo
+# ---------------------------
 def upsert_medicamento(df_src: pd.DataFrame):
     rows=[]
     for _,r in df_src.iterrows():
@@ -119,6 +194,9 @@ def upsert_medicamento(df_src: pd.DataFrame):
         conn.commit()
     print(f"[DIM_MEDICAMENTO] upsert {len(rows)}")
 
+# ---------------------------
+# DIM: Pedido
+# ---------------------------
 def upsert_pedido(df_src: pd.DataFrame):
     rows=[]
     for _,r in df_src.iterrows():
@@ -138,28 +216,41 @@ def upsert_pedido(df_src: pd.DataFrame):
         conn.commit()
     print(f"[DIM_PEDIDO] upsert {len(rows)}")
 
+# ---------------------------
+# MAIN
+# ---------------------------
 def main():
     with psycopg2.connect(**DB) as conn:
         # 1) Aseguradoras (de cualquier stg_*)
         upsert_aseguradora()
 
-        # 2) Pacientes (SCD2)
+        # 2) Pacientes (SCD2) — normalizando fechas
         rows={}
         with conn.cursor() as cur:
             cur.execute("""SELECT table_name FROM information_schema.tables 
                            WHERE table_schema=%s AND table_name LIKE 'stg_%%'""",(SCHEMA_STG,))
             for (t,) in cur.fetchall():
                 df = pd.read_sql(f'SELECT * FROM {SCHEMA_STG}."{t}"', conn)
+
                 col_id = pick(df,[r"(docu|id).*pac", r"paciente.*(id|doc)", r"identificacion", r"historia"]) or pick(df,[r"nombre"])
                 col_nombre = pick(df,[r"nombre", r"paciente"])
                 col_mun = pick(df,[r"munic", r"ciudad"])
                 col_est = pick(df,[r"depto|depart|estado"])
                 col_zona = pick(df,[r"zona|barrio"])
                 col_aseg = pick(df,[r"asegur|eps|ars"])
-                col_fing = pick(df,[r"fecha.*ingreso", r"ingreso"])
+                col_fing = pick(df,[r"fecha.*(ingreso|alta|registro)", r"ingreso", r"f_ingreso"])
+
                 for _,r in df.iterrows():
                     nk = str(r.get(col_id) or "").strip()
-                    if not nk: continue
+                    if not nk: 
+                        continue
+
+                    # Normaliza fecha de ingreso
+                    f_ing = None
+                    if col_fing:
+                        ts = normalize_date_any(r.get(col_fing))
+                        f_ing = ts.date() if ts is not None else None
+
                     rows[nk] = dict(
                         paciente_nk = nk,
                         nombre      = str(r.get(col_nombre) or "").strip(),
@@ -167,8 +258,9 @@ def main():
                         estado      = str(r.get(col_est) or "").strip(),
                         aseguradora = str(r.get(col_aseg) or "").strip(),
                         zona        = str(r.get(col_zona) or "").strip(),
-                        fecha_ingreso = r.get(col_fing)
+                        fecha_ingreso = f_ing
                     )
+
         if rows:
             scd2_upsert_paciente(pd.DataFrame(list(rows.values())))
 
