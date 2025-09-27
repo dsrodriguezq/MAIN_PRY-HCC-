@@ -1,10 +1,28 @@
-# etl_04_hechos.py — corregido: get_id con SCD2, normalización de fechas
-import os, re
+# etl_02_staging.py  — versión corregida (sin duplicar load_ts)
+import os, re, io, csv, glob
 import pandas as pd
-from unidecode import unidecode
 import psycopg2
-from psycopg2.extras import execute_values
-from datetime import datetime
+from psycopg2.extensions import connection as PGConn
+
+# 1) PON AQUÍ LA CARPETA DONDE ESTÁN TUS CSV:
+CSV_DIR = r"C:\Users\moran\OneDrive\Escritorio\Univalle\TERCERO\ETL Tesis\dw_pack"  # <- ajusta la ruta
+
+# 2) Nombres base (con o sin .csv). El script los resolverá dentro de CSV_DIR
+CSV_PATHS = {
+    "stg_equipos_entregados":       "Equipos Entregados.csv",
+    "stg_equipos_por_entregar":     "Equipos por entregar.csv",
+    "stg_equipos_retirados":        "Equipos Retirados.csv",
+    "stg_reporte_equipos":          "Reporte Equipos.csv",
+    "stg_maestro_equipos":          "Maestro Equipos.csv",
+    "stg_insumos_solicitados":      "Insumos Solicitados.csv",
+    "stg_insumos_solicitados_hist": "Insumos Solicitados Histórico.csv",
+    "stg_insumos_solicitados_hist_act": "Insumos Solicitados Histórico Actualizado.csv",
+    "stg_insumos_por_programar":    "Insumos por Programar.csv",
+    "stg_pedidos_parciales":        "Pedidos Parciales.csv",
+    "stg_insumos_al_proveedor":     "Insumos Solicitados al Proveedor.csv",
+    "stg_maestro_medicamentos":     "Maestro Medicamentos.csv",
+    "stg_maestro_insumos_medicos":  "Maestro Insumos Medicos.csv",
+}
 
 DB = dict(
     host=os.getenv("PGHOST","localhost"),
@@ -14,174 +32,106 @@ DB = dict(
     dbname=os.getenv("PGDATABASE","dw_salud"),
 )
 
-SCHEMA_STG="stg"; SCHEMA_DW="dw"
+def slug(s):
+    import unidecode
+    s = unidecode.unidecode(str(s)).strip().lower()
+    s = re.sub(r"[^a-z0-9]+","_",s)
+    return re.sub(r"_+","_",s).strip("_")
 
-# --- util: patrones y fechas ---
-def pick(df, pats):
-    for p in pats:
-        rx = re.compile(p)
-        for c in df.columns:
-            if rx.search(c): return c
-    return None
-
-SPANISH_MONTHS = {
-    "ene":"jan","feb":"feb","mar":"mar","abr":"apr","may":"may","jun":"jun",
-    "jul":"jul","ago":"aug","sep":"sep","set":"sep","oct":"oct","nov":"nov","dic":"dec",
-    "enero":"january","febrero":"february","marzo":"march","abril":"april","mayo":"may","junio":"june",
-    "julio":"july","agosto":"august","septiembre":"september","setiembre":"september",
-    "octubre":"october","noviembre":"november","diciembre":"diciembre"
-}
-def normalize_spanish_months(s: str) -> str:
-    if not s: return s
-    s0 = unidecode(str(s))
-    keys = sorted(SPANISH_MONTHS.keys(), key=len, reverse=True)
-    pat = r"\b(" + "|".join(re.escape(k) for k in keys) + r")\b"
-    def repl(m):
-        key = m.group(0).lower()
-        return SPANISH_MONTHS.get(key, m.group(0))
-    return re.sub(pat, repl, s0, flags=re.IGNORECASE)
-
-def normalize_date_any(value) -> pd.Timestamp | None:
-    if pd.isna(value): return None
-    s = str(value).strip()
-    if not s: return None
-    s_norm = normalize_spanish_months(s)
-    ts = pd.to_datetime(s_norm, errors="coerce", dayfirst=True, infer_datetime_format=True)
-    if pd.isna(ts):
-        for fmt in ("%d-%b-%Y %I:%M%p", "%d-%b-%Y", "%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y %H:%M", "%d-%m-%Y"):
+def read_csv_flexible(path: str) -> pd.DataFrame:
+    encs = ["utf-8-sig","latin1"]
+    seps = [None,";",","]
+    last = None
+    for e in encs:
+        for s in seps:
             try:
-                ts = pd.to_datetime(datetime.strptime(s_norm, fmt))
-                break
-            except Exception:
-                continue
-    return None if pd.isna(ts) else ts
+                if s is None:
+                    return pd.read_csv(path, sep=None, engine="python", encoding=e, on_bad_lines="skip")
+                else:
+                    return pd.read_csv(path, sep=s, encoding=e, on_bad_lines="skip")
+            except Exception as ex:
+                last = ex
+    raise last or RuntimeError(f"No se pudo leer {path}")
 
-# --- util: lookup IDs ---
-SCD2_TABLES = {"dim_paciente", "dim_equipo"}  # solo estas tienen es_actual
-
-def get_id(conn, table, id_col, nk_col, nk_val):
-    sql = f"SELECT {id_col} FROM {SCHEMA_DW}.{table} WHERE {nk_col}=%s"
-    params = [nk_val]
-    if table in SCD2_TABLES:
-        sql += " AND es_actual=TRUE"
+def ensure_staging(conn: PGConn, table: str, df: pd.DataFrame):
+    # NO incluir 'load_ts' aquí; la agregaremos al DF antes del COPY.
+    cols = [slug(c) for c in df.columns if slug(c) != "load_ts"]
+    cols_sql = ", ".join([f'"{c}" TEXT NULL' for c in cols] + ['"load_ts" TIMESTAMP NULL'])
+    sql = f'CREATE TABLE IF NOT EXISTS stg."{table}" ({cols_sql});'
     with conn.cursor() as cur:
-        cur.execute(sql, params)
-        r = cur.fetchone()
-        return r[0] if r else None
+        cur.execute(sql)
+        conn.commit()
 
-# =========================
-# HECHO: Equipos
-# =========================
-def load_hecho_equipos():
-    inserted=0
+def copy_df(conn: PGConn, df: pd.DataFrame, table: str):
+    # df YA debe traer 'load_ts'
+    buf = io.StringIO()
+    df.to_csv(buf, index=False, header=False, quoting=csv.QUOTE_MINIMAL)
+    buf.seek(0)
+    cols = [slug(c) for c in df.columns]  # incluye load_ts
+    cols_sql = ", ".join([f'"{c}"' for c in cols])
+    with conn.cursor() as cur:
+        cur.copy_expert(
+            f'COPY stg."{table}" ({cols_sql}) FROM STDIN WITH (FORMAT CSV, HEADER FALSE, DELIMITER ",");',
+            buf
+        )
+    conn.commit()
+
+def resolve_file(base_name_or_with_ext: str) -> str | None:
+    """
+    Busca dentro de CSV_DIR:
+      - Si trae extensión y existe: la usa.
+      - Si no trae extensión: intenta .csv/.CSV y búsqueda case-insensitive.
+    """
+    if os.path.isabs(base_name_or_with_ext) and os.path.exists(base_name_or_with_ext):
+        return base_name_or_with_ext
+
+    candidate = base_name_or_with_ext
+    root, ext = os.path.splitext(candidate)
+    if not ext:
+        candidate_csv = os.path.join(CSV_DIR, root + ".csv")
+        candidate_csv2 = os.path.join(CSV_DIR, root + ".CSV")
+        if os.path.exists(candidate_csv):  return candidate_csv
+        if os.path.exists(candidate_csv2): return candidate_csv2
+        pat = os.path.join(CSV_DIR, "*")
+        for p in glob.glob(pat):
+            if os.path.isfile(p):
+                stem = os.path.splitext(os.path.basename(p))[0]
+                if stem.lower() == root.lower() and os.path.splitext(p)[1].lower() == ".csv":
+                    return p
+        return None
+    else:
+        path = candidate if os.path.isabs(candidate) else os.path.join(CSV_DIR, candidate)
+        return path if os.path.exists(path) else None
+
+def main():
+    import datetime
+    print(f"[INFO] CSV_DIR: {CSV_DIR}")
+    print(f"[INFO] Archivos detectados en CSV_DIR:")
+    for p in sorted(glob.glob(os.path.join(CSV_DIR, "*"))):
+        print("   -", os.path.basename(p))
+
     with psycopg2.connect(**DB) as conn:
-        for t in ["stg_equipos_entregados","stg_equipos_retirados","stg_equipos_por_entregar","stg_reporte_equipos"]:
-            try:
-                df = pd.read_sql(f'SELECT * FROM {SCHEMA_STG}."{t}"', conn)
-            except Exception:
+        total = 0
+        for table, name in CSV_PATHS.items():
+            path = resolve_file(name)
+            if not path or not os.path.exists(path):
+                print(f"[SKIP] {table}: no existe archivo -> {name}")
                 continue
 
-            col_equipo = pick(df,[r"(serial|serie|codigo|equipo)"])
-            col_pac    = pick(df,[r"(docu|id).*pac|paciente|historia|nombre"])
-            col_aseg   = pick(df,[r"asegur|eps|ars"])
-            col_fecha  = pick(df,[r"fecha"])
-            if not (col_equipo and col_pac and col_aseg and col_fecha):
-                continue
+            df = read_csv_flexible(path)
+            df.columns = [slug(c) for c in df.columns]
 
-            df["_equipo_nk"]   = df[col_equipo].astype(str).str.strip()
-            df["_paciente_nk"] = df[col_pac].astype(str).str.strip()
-            df["_aseg_nk"]     = df[col_aseg].astype(str).str.strip().str.upper().map(unidecode)
-            df["_fecha_ts"]    = df[col_fecha].map(normalize_date_any)
-            df["_fecha"]       = df["_fecha_ts"].dropna().map(lambda x: x.date() if x is not None else None)
+            # 1) Crear tabla staging (sin load_ts duplicada)
+            ensure_staging(conn, table, df)
 
-            batch=[]
-            for _,r in df.dropna(subset=["_equipo_nk","_paciente_nk","_aseg_nk","_fecha"]).iterrows():
-                eid = get_id(conn,"dim_equipo","equipo_id","equipo_nk",r["_equipo_nk"])
-                pid = get_id(conn,"dim_paciente","paciente_id","paciente_nk",r["_paciente_nk"])
-                aid = get_id(conn,"dim_aseguradora","aseguradora_id","aseguradora_nk",r["_aseg_nk"])
-                if not all([eid,pid,aid]): 
-                    continue
-                batch.append((eid,pid,aid,r["_fecha"]))
+            # 2) Añadir load_ts y copiar
+            df["load_ts"] = datetime.datetime.now().isoformat(timespec="seconds")
+            copy_df(conn, df, table)
 
-            if batch:
-                with conn.cursor() as cur:
-                    execute_values(cur, """
-                        INSERT INTO dw.hecho_equipos(equipo_id,paciente_id,aseguradora_id,fecha_solicitud_id)
-                        VALUES %s
-                    """, batch)
-                conn.commit()
-                inserted += len(batch)
+            print(f"[STAGING] {table}: {len(df)} filas (desde {os.path.basename(path)})")
+            total += len(df)
 
-    print(f"[HECHO_EQUIPOS] insertados {inserted}")
+        print(f"[OK] Total filas staging: {total}")
 
-# =========================
-# HECHO: Solicitud Servicios
-# =========================
-def load_hecho_solicitud_servicios():
-    inserted=0
-    with psycopg2.connect(**DB) as conn:
-        for t in ["stg_insumos_solicitados","stg_pedidos_parciales","stg_insumos_solicitados_hist","stg_insumos_solicitados_hist_act"]:
-            try:
-                df = pd.read_sql(f'SELECT * FROM {SCHEMA_STG}."{t}"', conn)
-            except Exception:
-                continue
-
-            col_np   = pick(df,[r"(numero|num|nro).*pedido", r"pedido.*(num|numero|id)"])
-            col_pac  = pick(df,[r"(docu|id).*pac|paciente|historia|nombre"])
-            col_aseg = pick(df,[r"asegur|eps|ars"])
-            col_fecha= pick(df,[r"fecha"])
-            col_med  = pick(df,[r"(codigo|sku|referen).*", r"medicamento.*(id|codigo)"])
-            if not (col_np and col_pac and col_aseg and col_fecha and col_med):
-                continue
-
-            df["_np_nk"]   = df[col_np].astype(str).str.strip()
-            df["_pac_nk"]  = df[col_pac].astype(str).str.strip()
-            df["_aseg_nk"] = df[col_aseg].astype(str).str.strip().str.upper().map(unidecode)
-            df["_fecha_ts"]= df[col_fecha].map(normalize_date_any)
-            df["_fecha"]   = df["_fecha_ts"].dropna().map(lambda x: x.date() if x is not None else None)
-            df["_med_nk"]  = df[col_med].astype(str).str.strip()
-
-            batch=[]
-            for _,r in df.dropna(subset=["_np_nk","_pac_nk","_aseg_nk","_fecha","_med_nk"]).iterrows():
-                # dim_pedido (crea si falta)
-                with conn.cursor() as cur:
-                    cur.execute("SELECT numero_pedido_id FROM dw.dim_pedido WHERE numero_pedido_nk=%s",(r["_np_nk"],))
-                    rp = cur.fetchone()
-                    if not rp:
-                        cur.execute("INSERT INTO dw.dim_pedido(numero_pedido_nk) VALUES (%s) ON CONFLICT DO NOTHING",(r["_np_nk"],))
-                        cur.execute("SELECT numero_pedido_id FROM dw.dim_pedido WHERE numero_pedido_nk=%s",(r["_np_nk"],))
-                        rp = cur.fetchone()
-                np_id = rp[0] if rp else None
-
-                pac_id = get_id(conn,"dim_paciente","paciente_id","paciente_nk",r["_pac_nk"])
-                aseg_id= get_id(conn,"dim_aseguradora","aseguradora_id","aseguradora_nk",r["_aseg_nk"])
-
-                # dim_medicamento (crea si falta)
-                with conn.cursor() as cur:
-                    cur.execute("SELECT codigo_medicamento FROM dw.dim_medicamento WHERE medicamento_nk=%s",(r["_med_nk"],))
-                    rm = cur.fetchone()
-                    if not rm:
-                        cur.execute("INSERT INTO dw.dim_medicamento(medicamento_nk) VALUES (%s) ON CONFLICT DO NOTHING",(r["_med_nk"],))
-                        cur.execute("SELECT codigo_medicamento FROM dw.dim_medicamento WHERE medicamento_nk=%s",(r["_med_nk"],))
-                        rm = cur.fetchone()
-                med_id = rm[0] if rm else None
-
-                if not all([np_id,pac_id,aseg_id,med_id]): 
-                    continue
-                batch.append((np_id,pac_id,aseg_id,r["_fecha"],med_id))
-
-            if batch:
-                with conn.cursor() as cur:
-                    execute_values(cur, """
-                        INSERT INTO dw.hecho_solicitud_servicios(numero_pedido_id,paciente_id,aseguradora_id,fecha_solicitud_id,codigo_medicamento)
-                        VALUES %s
-                    """, batch)
-                conn.commit()
-                inserted += len(batch)
-
-    print(f"[HECHO_SOLICITUD_SERVICIOS] insertados {inserted}")
-
-# --------------------------
 if __name__ == "__main__":
-    load_hecho_equipos()
-    load_hecho_solicitud_servicios()
+    main()
