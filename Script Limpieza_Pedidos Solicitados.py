@@ -2,89 +2,118 @@ import pandas as pd
 import os
 import unicodedata
 import re
-from fuzzywuzzy import process
+from tqdm import tqdm
+from rapidfuzz import process, fuzz
 
-# --- RUTAS DE ARCHIVOS ---
+# ===============================================================
+# 📂 RUTAS DE ARCHIVOS
+# ===============================================================
 ruta_pedidos = r"C:\Users\luste\Downloads\Pedidos Solictados.csv"
 ruta_insumos = r"C:\Users\luste\Downloads\Insumos Medicos.csv"
-ruta_pacientes = r"C:\Users\luste\Downloads\Pacientes.csv"
+ruta_maestro = r"C:\Users\luste\Downloads\Maestro Medicamentos.csv"
 
-# --- VALIDACIÓN DE EXISTENCIA ---
-for ruta in [ruta_pedidos, ruta_insumos, ruta_pacientes]:
+for ruta in [ruta_pedidos, ruta_insumos, ruta_maestro]:
     if not os.path.exists(ruta):
         print(f"⚠️ El archivo no existe: {ruta}")
         exit()
 
-# --- FUNCIÓN DE NORMALIZACIÓN ---
+# ===============================================================
+# 🧽 FUNCIÓN DE NORMALIZACIÓN
+# ===============================================================
 def normalizar_texto(texto):
     if pd.isna(texto):
         return ""
     texto = str(texto).upper()
-    texto = ''.join(
-        c for c in unicodedata.normalize('NFKD', texto)
-        if not unicodedata.combining(c)
-    )  # elimina tildes
-    texto = re.sub(r'[^A-Z0-9 ]', ' ', texto)  # elimina símbolos raros
-    texto = re.sub(r'\s+', ' ', texto)  # reduce múltiples espacios a uno solo
-    texto = texto.strip()  # quita espacios al inicio y final
-    return texto
+    texto = ''.join(c for c in unicodedata.normalize('NFKD', texto)
+                    if not unicodedata.combining(c))
+    texto = re.sub(r'\bCMS\b', 'CM', texto)
+    texto = re.sub(r'\bMTS\b', 'MT', texto)
+    texto = re.sub(r'\bPU\b', '', texto)
+    texto = re.sub(r'\b(\d+)\s*MG\b', r'\1MG', texto)
+    texto = re.sub(r'\b(\d+)\s*ML\b', r'\1ML', texto)
+    texto = re.sub(r'\b(DE|POR|X|EL|LA|LOS|LAS|EN|CON|A|AL|INTRAMUSCULAR|INTRAVENOSA|ORAL)\b', '', texto)
+    texto = re.sub(r'[^A-Z0-9 ]+', ' ', texto)
+    texto = re.sub(r'\s+', ' ', texto)
+    return texto.strip()
 
-# --- LECTURA DE ARCHIVOS ---
-print("📥 Leyendo archivos...")
+# ===============================================================
+# 📥 LECTURA DE ARCHIVOS
+# ===============================================================
 pedidos = pd.read_csv(ruta_pedidos, sep=';', encoding='latin1', dtype=str)
 insumos = pd.read_csv(ruta_insumos, sep=';', encoding='latin1', dtype=str)
-pacientes = pd.read_csv(ruta_pacientes, sep=';', encoding='latin1', dtype=str)
-print("✅ Archivos cargados correctamente.")
+maestro = pd.read_csv(ruta_maestro, sep=';', encoding='latin1', dtype=str)
 
-# --- LIMPIEZA DE PEDIDOS ---
-pedidos = pedidos[~pedidos['Cedula'].str.contains('DEMO', case=False, na=False)]
+# ===============================================================
+# 💊 CONSOLIDADO
+# ===============================================================
+insumos['codigo'] = insumos['CODIGO INTERNO'].astype(str).str.replace(r'\.0$', '', regex=True)
+insumos['nombre'] = insumos['DESCRIPCIÓN DEL INSUMO']
+maestro['codigo'] = maestro['Código del Medicamento'].astype(str).str.replace(r'\.0$', '', regex=True)
+maestro['nombre'] = maestro['Nombre']
 
-# --- NORMALIZAR Y CRUZAR ---
-pedidos['Insumo Solicitado (norm)'] = pedidos['Insumo Solicitado'].apply(normalizar_texto)
-insumos['DESCRIPCIÓN DEL INSUMO (norm)'] = insumos['DESCRIPCIÓN DEL INSUMO'].apply(normalizar_texto)
-# --- CRUCE EXACTO PRIMERO ---
-merged = pedidos.merge(
-    insumos[['DESCRIPCIÓN DEL INSUMO (norm)', 'CODIGO INTERNO']],
-    left_on='Insumo Solicitado (norm)',
-    right_on='DESCRIPCIÓN DEL INSUMO (norm)',
-    how='left'
-)
+consolidado = pd.concat([insumos[['codigo', 'nombre']], maestro[['codigo', 'nombre']]], ignore_index=True)
+consolidado = consolidado[consolidado['codigo'].notna() & (consolidado['codigo'] != '') & 
+                          consolidado['nombre'].notna() & (consolidado['nombre'].str.strip() != '')]
+consolidado['nombre_norm'] = consolidado['nombre'].apply(normalizar_texto)
 
-# --- COINCIDENCIAS PARCIALES (solo donde no hubo match exacto) ---
-sin_codigo = merged[merged['CODIGO INTERNO'].isna()].copy()
+diccionario_codigos = consolidado.set_index('nombre_norm')['codigo'].to_dict()
+nombres_consolidado = list(diccionario_codigos.keys())
 
-if not sin_codigo.empty:
-    print(f"🔍 Realizando coincidencias parciales para {len(sin_codigo)} insumos sin código...")
+# ===============================================================
+# 🧮 PROCESAMIENTO DE PEDIDOS
+# ===============================================================
+pedidos = pedidos[~pedidos['Cedula'].str.contains('DEMO', case=False, na=False)].copy()
+pedidos_norm = pedidos.copy()
+pedidos_norm['Insumo_Solicitado_norm'] = pedidos_norm['Insumo Solicitado'].apply(normalizar_texto)
 
-    insumo_dict = dict(zip(insumos['DESCRIPCIÓN DEL INSUMO (norm)'], insumos['CODIGO INTERNO']))
-    lista_insumos = list(insumo_dict.keys())
+# --- Exact match ---
+pedidos_norm['codigo'] = pedidos_norm['Insumo_Solicitado_norm'].map(diccionario_codigos)
 
-    codigos_asignados = []
-    for texto in sin_codigo['Insumo Solicitado (norm)']:
-        match, score = process.extractOne(texto, lista_insumos)
-        if score >= 85:  # umbral de similitud, se puede ajustar
-            codigos_asignados.append(insumo_dict[match])
-        else:
-            codigos_asignados.append(None)
+# --- Parcial por primeras 4 palabras ---
+def buscar_codigo_parcial(nombre):
+    if not nombre:
+        return None
+    for maestro_norm in nombres_consolidado:
+        codigo = diccionario_codigos[maestro_norm]
+        primeras = maestro_norm.split()[:4]
+        if all(p in nombre for p in primeras):
+            return codigo
+    return None
 
-    sin_codigo['CODIGO INTERNO'] = codigos_asignados
+tqdm.pandas()
+mask = pedidos_norm['codigo'].isna()
+pedidos_norm.loc[mask, 'codigo'] = pedidos_norm.loc[mask, 'Insumo_Solicitado_norm'].progress_apply(buscar_codigo_parcial)
 
-    # Reemplazar los valores nulos originales por los encontrados
-    merged.update(sin_codigo)
+# --- Fuzzy match último recurso ---
+def buscar_codigo_fuzzy(nombre, umbral=85):
+    if not nombre:
+        return None
+    mejor = process.extractOne(nombre, nombres_consolidado, scorer=fuzz.token_sort_ratio)
+    if mejor and mejor[1] >= umbral:
+        return diccionario_codigos[mejor[0]]
+    return None
 
-# --- REEMPLAZAR INSUMO SOLICITADO POR CÓDIGO INTERNO ---
-merged['Insumo Solicitado'] = merged['CODIGO INTERNO'].fillna(merged['Insumo Solicitado'])
-merged.drop(['DESCRIPCIÓN DEL INSUMO (norm)', 'CODIGO INTERNO', 'Insumo Solicitado (norm)'], axis=1, inplace=True)
+mask = pedidos_norm['codigo'].isna()
+pedidos_norm.loc[mask, 'codigo'] = pedidos_norm.loc[mask, 'Insumo_Solicitado_norm'].progress_apply(buscar_codigo_fuzzy)
 
-# --- AGREGAR COLUMNA CLIENTE ---
-pacientes_subset = pacientes[['Identificacion', 'Nombre']].copy()
-pacientes_subset.rename(columns={'Identificacion': 'Cedula', 'Nombre': 'Cliente'}, inplace=True)
+# ===============================================================
+# 🔹 ELIMINAR REGISTROS SIN COINCIDENCIA
+# ===============================================================
+pedidos_filtrados = pedidos_norm[pd.notna(pedidos_norm['codigo'])].copy()
 
-final = merged.merge(pacientes_subset, on='Cedula', how='left')
+# Reemplazar Insumo Solicitado con el código encontrado
+pedidos_filtrados['Insumo Solicitado'] = pedidos_filtrados['codigo']
 
-# --- EXPORTAR RESULTADO ---
-ruta_salida = r"C:\Users\luste\Downloads\Pedidos_Solicitados_Limpio.csv"
-final.to_csv(ruta_salida, sep=';', index=False, encoding='latin1')
+# Mantener solo columnas originales
+columnas_originales = pedidos.columns.tolist()
+final = pedidos_filtrados[columnas_originales]
 
-print(f"💾 Archivo limpio y cruzado exportado en:\n{ruta_salida}")
-print("✅ Coincidencias exactas y parciales completadas correctamente.")
+# ===============================================================
+# 💾 EXPORTAR
+# ===============================================================
+from datetime import datetime
+ruta_salida = os.path.join(os.path.dirname(ruta_pedidos), f"Pedidos_Limpio_{datetime.now():%Y%m%d_%H%M}.csv")
+final.to_csv(ruta_salida, sep=';', index=False, encoding='utf-8-sig')
+
+print(f"\n✅ Archivo final exportado: {ruta_salida}")
+print(f"📊 Total de registros con código: {len(final):,}")
